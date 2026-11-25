@@ -3301,7 +3301,7 @@ async function fetchKRInvestorFlow(code) {
   }
 }
 
-  async function loadStockNewsAndDisclosure(code, stockName, market) {
+async function loadStockNewsAndDisclosure(code, stockName, market) {
     const titleEl = document.getElementById("newsStockTitle");
     const summaryEl = document.getElementById("stockIssueSummary");
     const listEl = document.getElementById("stockNewsList");
@@ -3324,47 +3324,109 @@ async function fetchKRInvestorFlow(code) {
     summaryEl.innerHTML = `<span class="loading">2026년 ${stockName} 공시 및 뉴스를 요약 중입니다...</span>`;
     listEl.innerHTML = "";
 
-    let items = [];
-    const searchKeyword = market === "US" ? `${code} stock OR earnings OR contract` : `${stockName} 공시 OR 실적 OR 수주`;
+    const items = [];
+    const seenTitle = new Set();
+    const pushUnique = (arr) => {
+      for (const it of arr) {
+        const key = it.title.replace(/\s+/g, "").slice(0, 18);
+        if (!key || seenTitle.has(key)) continue;
+        seenTitle.add(key);
+        items.push(it);
+      }
+    };
 
-    try {
-const qText = market === "US"
-  ? `${code} stock OR earnings`
-  : `${stockName} 주가 OR 공시 OR 실적`;
-const rssUrl = `https://news.google.com/rss/search?q=${encodeURIComponent(qText)}&hl=ko&gl=KR&ceid=KR:ko`;
-      const xmlText = await fetchViaProxy(rssUrl, "utf-8");
-      const xml = new DOMParser().parseFromString(xmlText, "text/xml");
-      Array.from(xml.querySelectorAll("item")).forEach(el => {
-        const title = el.querySelector("title")?.textContent?.trim() || "";
-        const link = el.querySelector("link")?.textContent?.trim() || "#";
-        const pubDateStr = el.querySelector("pubDate")?.textContent || "";
-        const pubDate = pubDateStr ? new Date(pubDateStr) : new Date();
-        if (title) items.push({ title, link, pubDate, source: "뉴스/공시" });
-      });
-    } catch (e) { console.warn("RSS 실패:", e); }
-
-    if (market === "KR" && items.length < 4) {
+    if (market === "KR") {
+      // 1차: 네이버 모바일 종목 뉴스 JSON API
       try {
-        const nUrl = `https://finance.naver.com/item/news_news.naver?code=${code}&page=1`;
-        const html = await fetchViaProxy(nUrl, "euc-kr");
-        const doc = new DOMParser().parseFromString(html, "text/html");
-        doc.querySelectorAll("table.type5 tr").forEach(tr => {
-          const a = tr.querySelector("td.title a");
-          const dateTd = tr.querySelector("td.date");
-          if (a) {
-            const href = a.getAttribute("href") || "";
-            const fullLink = href.startsWith("http") ? href : `https://finance.naver.com${href}`;
-            const dStr = dateTd?.textContent?.trim() || "";
-            const parsedDate = dStr ? new Date(dStr.replace(/\./g, "-")) : new Date();
-            items.push({
-              title: a.textContent.trim(),
-              link: fullLink,
-              pubDate: isNaN(parsedDate.getTime()) ? new Date() : parsedDate,
-              source: "종목뉴스"
+        const mNewsUrl = `https://m.stock.naver.com/api/news/stock/${code}?pageSize=12&page=1`;
+        const raw = await fetchViaProxy(mNewsUrl, "utf-8");
+        const json = JSON.parse(raw);
+
+        const rawList = Array.isArray(json)
+          ? json.flatMap(g => Array.isArray(g.items) ? g.items : [g])
+          : (json.items || json.result || json.news || []);
+
+        const parsed = [];
+        for (const row of rawList) {
+          if (!row || typeof row !== "object") continue;
+          const title = String(row.title || row.tit || row.headline || "").replace(/<[^>]+>/g, "").trim();
+          const oid = row.officeId || row.oid || "";
+          const aid = row.articleId || row.aid || "";
+          const link = row.url || row.link || (oid && aid
+            ? `https://n.news.naver.com/mnews/article/${oid}/${aid}`
+            : `https://m.stock.naver.com/domestic/stock/${code}/news`);
+
+          const dtRaw = String(row.datetime || row.wdate || row.date || "");
+          let pubDate = new Date();
+          if (/^\d{8}/.test(dtRaw)) {
+            pubDate = new Date(`${dtRaw.slice(0, 4)}-${dtRaw.slice(4, 6)}-${dtRaw.slice(6, 8)}`);
+          } else if (dtRaw) {
+            const d = new Date(dtRaw);
+            if (!isNaN(d.getTime())) pubDate = d;
+          }
+
+          if (title) {
+            parsed.push({
+              title,
+              link,
+              pubDate,
+              source: row.officeName || row.source || "종목뉴스"
             });
           }
-        });
-      } catch (e) { console.warn("종목 뉴스 파싱 실패:", e); }
+        }
+        pushUnique(parsed);
+      } catch (e) {
+        console.warn("네이버 모바일 뉴스 API 실패:", e);
+      }
+
+      // 2차: 네이버 모바일 공시 JSON API
+      try {
+        const mNoticeUrl = `https://m.stock.naver.com/api/stock/${code}/notice?pageSize=6&page=1`;
+        const rawN = await fetchViaProxy(mNoticeUrl, "utf-8");
+        const jsonN = JSON.parse(rawN);
+        const nList = Array.isArray(jsonN) ? jsonN : (jsonN.items || jsonN.result || jsonN.notices || []);
+
+        const parsedN = [];
+        for (const row of nList) {
+          if (!row || typeof row !== "object") continue;
+          const title = String(row.title || row.tit || row.subject || "").replace(/<[^>]+>/g, "").trim();
+          const dtRaw = String(row.date || row.datetime || row.wdate || "");
+          let pubDate = new Date();
+          if (/^\d{8}/.test(dtRaw)) {
+            pubDate = new Date(`${dtRaw.slice(0, 4)}-${dtRaw.slice(4, 6)}-${dtRaw.slice(6, 8)}`);
+          } else if (dtRaw) {
+            const d = new Date(dtRaw);
+            if (!isNaN(d.getTime())) pubDate = d;
+          }
+          if (title) {
+            parsedN.push({
+              title: `[공시] ${title}`,
+              link: row.url || `https://m.stock.naver.com/domestic/stock/${code}/notice`,
+              pubDate,
+              source: "전자공시"
+            });
+          }
+        }
+        pushUnique(parsedN);
+      } catch (e) {
+        console.warn("네이버 모바일 공시 API 실패:", e);
+      }
+    } else {
+      // 미국장: Yahoo Finance 차트/뉴스 검색 JSON API
+      try {
+        const yUrl = `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(code)}&newsCount=8&quotesCount=0`;
+        const rawY = await fetchViaProxy(yUrl, "utf-8");
+        const jsonY = JSON.parse(rawY);
+        const yNews = Array.isArray(jsonY.news) ? jsonY.news : [];
+        pushUnique(yNews.map(n => ({
+          title: n.title || "",
+          link: n.link || `https://finance.yahoo.com/quote/${encodeURIComponent(code)}`,
+          pubDate: n.providerPublishTime ? new Date(n.providerPublishTime * 1000) : new Date(),
+          source: n.publisher || "Yahoo Finance"
+        })).filter(x => x.title));
+      } catch (e) {
+        console.warn("Yahoo 뉴스 API 실패:", e);
+      }
     }
 
     if (items.length === 0) {
@@ -3398,7 +3460,6 @@ const rssUrl = `https://news.google.com/rss/search?q=${encodeURIComponent(qText)
     });
     renderNewsItemsWithActions(listEl, formattedStockNews, `stk_${code}`);
   }
-
   /* =========================================================================
      차트 렌더링 & 전체 분석 실행
      ========================================================================= */
